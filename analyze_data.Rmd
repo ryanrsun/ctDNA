@@ -1,0 +1,981 @@
+---
+title: "Code to Reproduce Analysis in Parseghian, Sun, Woods, et al."
+author: ''
+date: ''
+output:
+  pdf_document: default
+  word_document: default
+geometry: margin=1in
+classoption: portrait
+---
+    
+<!-- SHIFT + Command + c to comment out blocks of text like this! -->
+
+```{r setup, include=FALSE}
+
+knitr::opts_chunk$set(echo = FALSE)
+options(stringsAsFactors = FALSE)
+library(survival)
+library(surv2sampleComp)
+library(survRM2)
+library(survminer)
+library(tidyverse)
+library(magrittr)
+library(data.table)
+library(sas7bdat)
+library(ggplot2)
+library(cowplot)
+
+LOD <- 0.1
+
+```
+
+```{r, read data, warning=FALSE, cache=FALSE, eval=TRUE, message=FALSE, results='hide'}
+
+allCov <- fread("allCov.txt", data.table = FALSE)
+somat203 <- fread("mutations203.txt", data.table = FALSE)
+somat763 <- fread("mutations763.txt", data.table = FALSE)
+somat007 <- fread("mutations007.txt", data.table = FALSE)
+rmafPaired <- fread("rmafPaired.txt", data.table = FALSE)
+absPaired <- fread("absPaired.txt", data.table = FALSE)
+
+```
+
+
+```{r plot function, include=FALSE}
+
+# dichotomize the colIdx columns of matrix mat
+dichot <- function(mat, colIdx) {
+  mat <- data.frame(mat)
+  applyDichot <- function(x) {
+    x <- ifelse(x > 0, 1, 0)
+    return(x)
+  }
+  
+  # apply it
+  mat[, colIdx] <- apply(mat[, colIdx], 2, applyDichot)
+  return(mat)
+}
+
+# calc CIs
+calcCI <- function(x, n, approx=TRUE, high = TRUE, alpha=0.05) {
+  # approx wald
+  if (approx) {
+    samp_prop <- x/n
+    sd <- sqrt(((x/n) * (n-x)/n) / n)
+    lo <- samp_prop - qnorm(1-alpha/2) * sd
+    hi <- samp_prop + qnorm(1-alpha/2) * sd
+    if (high) {
+      return(hi)
+    } else {return(lo)}
+  } else {
+    # exact clopper-pearson
+    lo_exact <- qbeta(alpha/2, x, n-x+1)
+    hi_exact <- qbeta(1-alpha/2, x+1, n-x)
+    if (high) {
+      return(hi_exact)
+    } else {return(low_exact)}
+  }
+}
+
+# Plots acquired KRAS, NRAS, BRAF, EGFR, MAP2K1 mutations.
+# Give it a dataset with paired information, baseline/followup indicator,
+# and at least those gene MAFs.
+# Make sure only paired data is in dat.
+# covDat is needed to get EGFRi only.
+plot_acquired <- function(dat, legLabs, ylimits, plotCols, legTitle) {
+  
+  nGroups <- length(unique(dat$Group))
+  
+  # baseline
+  bDat <- dat %>% filter(binTime == "Baseline") %>%
+    dplyr::select(subID, Group, KRAS, NRAS, BRAF, EGFR, MAP2K1) %>%
+    dplyr::arrange(subID) %>%
+    dichot(., colIdx = 3:7)
+  
+  # follow-up
+  fDat <- dat %>% filter(binTime == "FUP") %>%
+    dplyr::select(subID, Group, KRAS, NRAS, BRAF, EGFR, MAP2K1) %>%
+    dplyr::arrange(subID) %>%
+    dichot(., colIdx = 3:7)
+  
+  # change data
+  # should be sorted and paired, so you can just subtract columns 3-7
+  changeDat <- bDat %>% dplyr::select(subID, Group) %>%
+    dplyr::mutate(KRAS = fDat$KRAS - bDat$KRAS) %>%
+    dplyr::mutate(NRAS = fDat$NRAS - bDat$NRAS) %>%
+    dplyr::mutate(BRAF= fDat$BRAF - bDat$BRAF) %>%
+    dplyr::mutate(EGFR = fDat$EGFR - bDat$EGFR) %>%
+    dplyr::mutate(MAP2K1 = fDat$MAP2K1 - bDat$MAP2K1) %>%
+    # the dichot gets rid of -1
+    dichot(., colIdx = 3:7) %>%
+    dplyr::mutate(Any = ifelse(KRAS == 1 | NRAS == 1 | MAP2K1 == 1 | BRAF == 1 | EGFR == 1, 1, 0))
+  
+  # plot data
+  # have to make it longer, one row for each gene
+  plotDat <- changeDat %>% tidyr::pivot_longer(cols = c("KRAS", "NRAS", "MAP2K1", 
+                                                        "BRAF", "EGFR", "Any"),
+                                        names_to="Gene", values_to="Exist") %>%
+    # grouped (usually by study)
+    group_by(Group, Gene) %>%
+    # find percentages
+    summarise(x=sum(Exist), n=n(), Pct = mean(Exist)) %>%
+    set_colnames(c("Group", "Gene", "x", "n", "Pct")) %>%
+    mutate(CIlow = calcCI(x=x, n=n, high=FALSE)) %>%
+    mutate(CIlow = ifelse(CIlow < 0, 0, CIlow)) %>%
+    mutate(CIhigh = calcCI(x=x, n=n, high=TRUE)) %>%
+    # he wants a different color for any
+    mutate(GroupGene = ifelse(Gene == "Any", paste0(Group, "_0"), Group)) 
+  
+  # factors in the correct order
+  plotDat$Gene <- factor(plotDat$Gene,levels = c("Any", "KRAS", "NRAS", "EGFR", "BRAF", "MAP2K1"))
+  
+  # variable widths
+  # default width of bar will be 0.8, put 0.2 width around each bar
+  plotDat <- plotDat %>% arrange(Gene, Group)
+  betweenBars <- 0.4
+  barWidth <- 0.8
+  # these are the widths of the bars, make the first one smaller
+  customWidths <- c(barWidth / 2, rep(barWidth, 5))
+  # these are the widths of the bars + space
+  customBox <- rep(barWidth + betweenBars, 6)
+  # midpoints of the box = end of previous box + half of current box
+  breakPos <- 0.5 * ( cumsum(customBox) + cumsum(c(0, customBox[-length(customBox)])) )
+  if (nGroups == 2) {
+    customWidths <- c(barWidth / 4, barWidth / 4, rep(barWidth / 2, 10))
+    customPos <- sort(c(breakPos - barWidth / 4, breakPos + barWidth / 4))
+    customPos[1:2] <- c(customBox[1] / 2 - barWidth / 8, customBox[1] / 2 + barWidth / 8) 
+  } else {
+    customPos <- breakPos
+  }
+  
+  # plot
+  returnPlot <- ggplot() + 
+    geom_bar(stat = "identity", width = customWidths, aes(x = customPos, y = plotDat$Pct, fill = as.factor(plotDat$GroupGene))) + 
+    scale_fill_manual(breaks=legLabs, values=plotCols, name=legTitle) +
+    ylab("Percent of Subjects Acquiring") + xlab("Mutation") +
+    ggtitle("") + 
+    geom_errorbar(aes(ymin=plotDat$CIlow, ymax=plotDat$CIhigh, x = customPos),
+                width=customWidths)  +
+    theme_cowplot() + 
+    theme(axis.text.x = element_text(angle = 0, vjust = 1, hjust=0.5, size=12, face="italic"),
+        axis.text.y = element_text(size = 10)) +
+    scale_y_continuous(labels = scales::percent, limits=ylimits) +
+    scale_x_continuous(labels = unique(plotDat$Gene), breaks = breakPos)
+
+  return(list(plot = returnPlot, tab = plotDat, changeDat = changeDat))
+} 
+
+```
+
+
+#  Figure 1
+
+```{r, Fig 1, eval=TRUE, results='show', message=FALSE, cache=TRUE, warning=FALSE}
+
+# Fig 1a
+datFig1a <- absPaired %>% mutate(Group = substr(subID, 1, 3)) %>%
+  filter(Group == "203") %>%
+  mutate(Group = "1L, 203 study") %>%
+  merge(., allCov %>% dplyr::select(subID, EGFRi), by="subID") %>%
+  filter(EGFRi == 1)
+
+output1a <- plot_acquired(dat = datFig1a, legLabs = c("1L, 203 study"), ylimits=c(0, 0.6),
+                          plotCols = c("green", "darkgreen"), legTitle = "Study")
+output1a$tab
+output1a$plot
+
+# Fig 1b
+datFig1b <- absPaired %>% mutate(Group = substr(subID, 1, 3)) %>%
+  filter(Group == "007" | Group == "763") %>%
+  mutate(Group = ifelse(Group == "007", "3L, 007 study", "3L, 763 study")) %>%
+  merge(., allCov %>% dplyr::select(subID, EGFRi), by="subID") %>%
+  filter(EGFRi == 1)
+output1b <- plot_acquired(dat = datFig1b, legLabs = c("3L, 007 study", "3L, 763 study"), ylimits=c(0, 0.6),
+                          plotCols = c("plum2", "darkorchid4","steelblue2","navyblue"), legTitle = "Study")
+output1b$plot
+output1b$tab
+
+```
+
+\newpage 
+
+# Figure 2
+
+
+```{r, Figure 2, eval=TRUE, results='show', message=FALSE, cache=TRUE, warning=FALSE}
+datFig2a <- merge(absPaired, cov203 %>% mutate(subID = paste0("203_", subID)) %>%
+                    dplyr::select(subID, Trt), by="subID") %>%
+  mutate(Group = ifelse(Trt == "FFox", "FOLFOX", "FOLFOX + Pani")) 
+output2a <- plot_acquired(dat = datFig2a,  legLabs = c("FOLFOX", "FOLFOX + Pani"), ylimits=c(0, 0.6),
+                          plotCols = c("grey69", "red1", "black", "red4"), legTitle = "Study")
+output2a$tab
+output2a$plot
+
+datFig2b <- merge(absPaired, cov007 %>% mutate(subID = paste0("007_", subID)) %>%
+                    dplyr::select(subID, Trt), by="subID") %>%
+  mutate(Group = ifelse(Trt == "BSC", "BSC", "Panitumumab"))
+output2b <- plot_acquired(dat = datFig2b, legLabs = c("BSC", "Panitumumab"), ylimits=c(0, 0.6),
+                          plotCols = c("hotpink1", "hotpink4", "burlywood1", "burlywood4"), legTitle = "Study")
+output2b$tab
+output2b$plot
+
+```
+
+
+# Figure 3
+
+
+
+```{r, Figure 3, eval=TRUE, results='show', message=FALSE, cache=TRUE, warning=FALSE}
+
+datFig3a <- merge(absPaired, allCov %>% mutate(ResponseBin = ifelse(Response == "PD", 0, 1)) %>%
+                   dplyr::mutate(Study = substr(subID, 1, 3)) %>% filter(Study == "203") %>%
+                   dplyr::select(subID, ResponseBin, Trt), by="subID") %>%
+  mutate(Group = ifelse(ResponseBin == 0, "PD", "CR/PR/SD")) %>%
+  filter(Trt == "PaniFFox")
+output3a <- plot_acquired(dat = datFig3a, legLabs = c("PD", "CR/PR/SD"), ylimits=c(0, 0.6),
+                          plotCols = c("aquamarine1", "aquamarine4", "violetred4", "violetred1"), 
+                          legTitle = "Response")
+output3a$tab
+output3a$plot
+
+
+datFig3b <- merge(absPaired, allCov %>% mutate(ResponseBin = ifelse(Response == "PD", 0, 1)) %>%
+                   dplyr::mutate(Study = substr(subID, 1, 3)) %>% filter(Study != "203") %>%
+                   dplyr::select(subID, ResponseBin, Trt), by="subID") %>%
+  mutate(Group = ifelse(ResponseBin == 0, "PD", "CR/PR/SD")) %>%
+  filter(Trt != "BSC")
+output3b <- plot_acquired(dat = datFig3b, legLabs = c("PD", "CR/PR/SD"), ylimits=c(0, 0.6),
+                          plotCols = c("aquamarine1", "aquamarine4", "violetred1", "violetred4"),
+                          legTitle = "Response")
+output3b$tab
+output3b$plot
+
+
+```
+
+
+# Figure 4
+
+
+```{r, Fig 4, eval=TRUE, results='show', message=FALSE, cache=TRUE, warning=FALSE}
+
+# long vs. short is set at 4 months by clinicians
+datFig4a <- merge(absPaired, allCov %>% mutate(TrtDur = TrtEnd - TrtStart) %>%
+                  dplyr::mutate(Study = substr(subID, 1, 3)) %>% filter(Study == "203") %>%
+                  dplyr::select(subID, TrtDur, EGFRi), by="subID") %>%
+  filter(EGFRi == 1) %>%
+  dplyr::mutate(PFSbin = ifelse(TrtDur >= 122, 1, 0)) %>%
+  mutate(Group = ifelse(PFSbin == 1, "Long PFS", "Short PFS")) 
+
+output4a <- plot_acquired(dat = datFig4a, legLabs = c("Long PFS", "Short PFS"), ylimits=c(0, 0.6),
+                          plotCols = c("blue", "darkblue", "red", "red4"), legTitle = "Survival")
+output4a$tab
+output4a$plot
+
+
+datFig4b <- merge(absPaired, allCov %>% mutate(TrtDur = TrtEnd - TrtStart) %>%
+                  dplyr::mutate(Study = substr(subID, 1, 3)) %>% filter(Study != "203") %>%
+                  dplyr::select(subID, TrtDur, EGFRi), by="subID") %>%
+  filter(EGFRi == 1) %>%
+  dplyr::mutate(PFSbin = ifelse(TrtDur >= 122, 1, 0)) %>%
+  mutate(Group = ifelse(PFSbin == 1, "Long PFS", "Short PFS")) 
+
+output4b <- plot_acquired(dat = datFig4b, legLabs = c("Long PFS", "Short PFS"), ylimits=c(0, 0.6),
+                          plotCols = c("blue", "darkblue", "red", "red4"), legTitle = "Survival")
+output4b$tab
+output4b$plot
+
+```
+
+
+
+# Heatmap of mutations
+
+```{r, mutations heatmap, eval=TRUE, results='show', cache=TRUE, warning=FALSE, message=FALSE,}
+
+# calculate gene frequencies for arrangement order
+geneNames <- colnames(absPaired)[4:35]
+checkFreq <- function(x) {mean(as.numeric(x > 0))}
+freqDF <- data.frame(Gene = geneNames, Freqs = absPaired %>% dplyr::select(all_of(geneNames)) %>%
+                       apply(., 2, checkFreq)) %>%
+  dplyr::arrange(Freqs) %>%
+  dplyr::mutate(Gene = factor(Gene, levels=Gene))
+
+
+# make heatmap of acquired mutations
+makeHeatmapAcq <- function(studyVec,  fullDat, maxGene = 0.05, maxSub = 0.1, bumpLeft=0, 
+                           onlyEGFR = TRUE, covDat) {
+  # remove low frequency mutations
+  fullDat <- fullDat %>% dplyr::select(-FGFR1, -FLT3, -AKT1)
+  
+  # dichotomize the data
+  bdat <- fullDat %>%
+    dplyr::filter(substr(subID, 1, 3) %in% studyVec & binTime == "Baseline") %>%
+    dplyr::arrange(subID) %>%
+    dplyr::select(-binTime, -paired)
+  fdat <- fullDat %>%
+    dplyr::filter(substr(subID, 1, 3) %in% studyVec & binTime == "FUP") %>%
+    dplyr::arrange(subID) %>%
+    dplyr::select(-binTime, -paired)
+  bdatDichot <- sapply(bdat %>% dplyr::select(-subID), FUN = function(x) {as.numeric(x > 0)})
+  # if it's clonal, it's 5, otherwise it's 1
+  fdatDichot <- sapply(fdat %>% dplyr::select(-subID), FUN = function(x) {as.numeric(x > 0) + 4 * as.numeric(x > 25)})
+
+  # calculate acquired
+  changeDatTemp <- as.data.frame(fdatDichot - bdatDichot) 
+  changeDat <- sapply(changeDatTemp, FUN = function(x) {ifelse(x %in% c(1, 5), x, 0)}) %>%
+    as.data.frame(.) %>% mutate(subID = bdat$subID) %>%
+    merge(., covDat %>% dplyr::select(subID, EGFRi), by="subID") 
+  if (onlyEGFR) {
+    changeDat <- changeDat %>% dplyr::filter(EGFRi == 1)
+  }
+  # pivot longer
+  changeDatLong <- changeDat %>% 
+    pivot_longer(., cols=colnames(bdatDichot), names_to="Gene", values_to="Gain") %>%
+    dplyr::select(-EGFRi)
+  
+  #-------------------------------------------------------------------------------------#
+  # any for pie chart
+  anyCols <- which(colnames(changeDat) %in% c("EGFR", "NRAS", "KRAS", "BRAF", "MAP2K1"))
+  anyVec <- ifelse(apply(changeDat[, anyCols], 1, sum) > 0, 1, 0)
+  anyDat <- data.frame(Group = c("None", "Named Mut"), Num = c(sum(1 - anyVec), sum(anyVec))) 
+  anyDat$Group = factor(anyDat$Group, levels=c("None", "Named Mut"))
+  
+  # pie chart
+  pieChart <- ggplot(anyDat, aes(x="", y=Num, fill = Group)) + 
+    geom_bar(stat = "identity", width = 1) + 
+    #scale_fill_manual(values = c("darkgreen", "salmon")) + 
+    scale_fill_manual(values = c("blue", "red"), labels=c("None", "Named Mutation"), name="Acquired Mutation") + 
+    coord_polar("y", start = 0) + 
+    theme_void()
+  
+  #-------------------------------------------------------------------------------------#
+  
+  # split gene frequencies into clonal and subclonal for this study
+  # still order by overall rate of mutations in all sample, which is freqDF
+  geneDF <- freqDF %>% mutate(subFreq = 0, clonalFreq = 0)
+  nSub <- length(unique(changeDatLong$subID))
+  # loop through each gene, split into clonal and subclonal
+  for (row_it in 1:nrow(geneDF)) {
+    tempGene <- geneDF$Gene[row_it]
+    tempDat <- changeDatLong %>% dplyr::filter(Gene == tempGene)
+    geneDF$subFreq[row_it] <- length(which(tempDat$Gain == 1)) / nSub
+    geneDF$clonalFreq[row_it] <- length(which(tempDat$Gain == 5)) / nSub
+  }
+  # all mutational percentages for this study
+  geneDF <- geneDF %>% dplyr::mutate(total = subFreq + clonalFreq) %>%
+    dplyr::filter(!(Gene %in% c("AKT1", "FLT3", "FGFR1")))
+  # make it long format
+  geneDFlong <- geneDF %>% dplyr::select(Gene, total) %>%
+    set_colnames(c("Gene", "Freq"))
+  
+  # plot
+  # different colors for named mutations
+  geneDFlong <- geneDFlong %>%
+    mutate(Type = ifelse(Gene %in% c("KRAS", "BRAF", "NRAS", "EGFR", "MAP2K1"),
+           "Resistance", "Other"))
+  # plot the gene frequencies
+  geneFreqPlot <- ggplot(geneDFlong, aes(x=Gene, y=Freq, fill=Type)) +
+    geom_bar(stat="identity") + 
+    scale_fill_manual(values=c("blue", "darkgreen")) + 
+    scale_y_continuous(breaks=c(0, maxGene), position="right", limits=c(0, NA)) +
+    coord_flip() + 
+    #ylim(c(0, 0.8)) +
+    xlab("") + ylab("") + 
+    theme_cowplot() + 
+    theme(axis.text.y = element_text(hjust=0),
+      plot.margin=grid::unit(c(0,0,7,0), "mm"))
+  
+  #-------------------------------------------------------------------------------------#
+
+  # for plotting subject barchart
+  # split subject frequencies into clonal and subclonal for this study 
+  subDF <- data.frame(subID = unique(changeDatLong$subID), subCount = NA, clonalCount = NA)
+  nGene <- nrow(geneDF)
+  # loop through each subject
+  for (row_it in 1:nrow(subDF)) {
+    tempSub <- subDF$subID[row_it]
+    tempDat <- changeDatLong %>% dplyr::filter(subID == tempSub)
+    subDF$subCount[row_it] <- length(which(tempDat$Gain == 1)) 
+    subDF$clonalCount[row_it] <- length(which(tempDat$Gain == 5)) 
+  }
+  # get the frequencies
+  subDF <- subDF %>% 
+    dplyr::mutate(subFreq = subCount / nGene) %>%
+    dplyr::mutate(clonalFreq = clonalCount / nGene) 
+  # make it long format
+  subDFlong <- subDF %>% 
+    dplyr::mutate(totalCount = subCount + clonalCount) %>%
+    dplyr::select(subID, totalCount) %>%
+    set_colnames(c("Sub", "Count")) %>%
+    dplyr::arrange(desc(Count)) %>%
+    dplyr::mutate(Sub = factor(Sub, levels=unique(Sub)))
+  
+  # plot subject frequencies
+  subFreqPlot <- ggplot(subDFlong, aes(x=Sub, y=Count)) +
+    geom_bar(stat="identity", position="stack", fill="blue") + 
+    scale_y_continuous(breaks=c(0, maxSub), limits = c(0, maxSub)) +
+    xlab("") + ylab("") + 
+    theme_cowplot() + 
+    theme(
+      axis.text.x = element_blank(),
+      axis.ticks = element_blank(),
+      plot.margin=grid::unit(c(3,0,0,bumpLeft), "mm"))
+  
+  #-------------------------------------------------------------------------------------#
+
+  # plot heatmap
+  changeDatLong$Gene <- factor(changeDatLong$Gene, levels=geneDF$Gene)
+  changeDatLong$subID = factor(changeDatLong$subID, levels=levels(subDFlong$Sub))
+  changeDatLong <- changeDatLong %>% mutate(Gain = ifelse(Gain == 5, 2, Gain))
+  heatmapPlot <- ggplot(changeDatLong, aes(x=subID, y=Gene)) + 
+    geom_tile(aes(fill=Gain), color="black") +
+    scale_fill_gradient2(low="white", mid="blue", high="blue", midpoint=1) + 
+    scale_y_discrete(position="left", labels=paste0(round(geneDF$total * 100, digits=0), "%")) + 
+    xlab("") + ylab("") +
+    theme_cowplot() + 
+    theme( axis.text.x = element_blank(),
+      axis.ticks = element_blank(),
+      plot.margin=grid::unit(c(12,0,0,0), "mm"))
+  
+  # grab legend
+  tempLegend <- get_legend(geneFreqPlot)
+  
+  # put it all together
+  # need the negative row in there for correct spacing
+  totalPlot <- plot_grid(subFreqPlot + theme(legend.position="none"), NULL, NULL,
+                          NULL, NULL, NULL,
+                          heatmapPlot + theme(legend.position="none"), geneFreqPlot + theme(legend.position="none"), 
+                          tempLegend, nrow=3, rel_widths = c(1, 0.25, 0.25), rel_heights=c(0.25, -0.1, 1))
+
+  # return
+  return(list(totalPlot = totalPlot, heatmapPlot = heatmapPlot, pieChart = pieChart, pieDat = anyDat))
+}
+
+# plots
+acq203 <- makeHeatmapAcq(studyVec = c("203"), fullDat = absPaired, maxGene = 0.05, maxSub = 12, bumpLeft = 1,
+                         covDat = allCov)
+acq203$totalPlot
+acq007 <- makeHeatmapAcq(studyVec = c("007"), fullDat = absPaired, maxGene = 0.15, maxSub = 12, bumpLeft = 3.5,
+                         covDat = allCov)
+acq007$totalPlot
+acq763 <- makeHeatmapAcq(studyVec = c("763"), fullDat = absPaired, maxGene = 0.15, maxSub = 12, bumpLeft = 3.5,
+                         covDat = allCov)
+acq763$totalPlot
+
+```
+
+
+# Sankey Plot
+
+```{r, sankey plot, eval=TRUE, results='show', cache=TRUE, warning=FALSE, message=FALSE,}
+
+# plot function - assume the dat has already been filtered to EGFRi only
+plot_sankey <- function(dat,  shortenLabel = FALSE) {
+  # baseline
+  bDat <- dat %>% filter(binTime == "Baseline") %>%
+    dplyr::select(subID, Response, KRAS, NRAS, BRAF, EGFR, MAP2K1) %>%
+    dplyr::arrange(subID) %>%
+    dichot(., colIdx = 3:7)
+  
+  # follow-up
+  fDat <- dat %>% filter(binTime == "FUP") %>%
+    dplyr::select(subID, Response, KRAS, NRAS, BRAF, EGFR, MAP2K1) %>%
+    dplyr::arrange(subID) %>%
+    dichot(., colIdx = 3:7)
+  
+  # change data  
+  changeDat <- bDat %>% dplyr::select(subID, Response) %>%
+    dplyr::mutate(KRAS = fDat$KRAS - bDat$KRAS) %>%
+    dplyr::mutate(NRAS = fDat$NRAS - bDat$NRAS) %>%
+    dplyr::mutate(BRAF= fDat$BRAF - bDat$BRAF) %>%
+    dplyr::mutate(EGFR = fDat$EGFR - bDat$EGFR) %>%
+    dplyr::mutate(MAP2K1 = fDat$MAP2K1 - bDat$MAP2K1) %>%
+    # the dichot gets rid of -1
+    dichot(., colIdx = 3:7) %>%
+    dplyr::mutate(Any = ifelse(KRAS == 1 | NRAS == 1 | MAP2K1 == 1 | BRAF == 1 | EGFR == 1, 1, 0)) %>%
+    mutate(Total = ifelse(Any == 0, "0 Mut", ">=1 Mut")) %>%
+    mutate(Total = factor(Total, levels=c("0 Mut", ">=1 Mut"))) 
+  
+  # plot data
+  plotDat <- table(changeDat %>% dplyr::select(Response, Total)) %>%
+    as.data.frame(.) %>%
+    dplyr::mutate(Response = as.character(Response)) %>%
+    dplyr::mutate(Response = ifelse(Response == "PR", "CR/PR", Response)) %>%
+    dplyr::mutate(Response = factor(Response, levels=c("PD", "SD", "CR/PR")))
+  
+  # manual adjustment for text label
+  if (shortenLabel) {
+    plotDat <- plotDat %>% mutate(Total = ifelse(Total == "0 Mut", "0 Mut", ">=1"))
+  }  
+  
+  # ggforce package will plot it
+  plotDatGathered <- ggforce::gather_set_data(plotDat, 1:2)
+  ggforcePlot <- ggplot(plotDatGathered, aes(x, id = id, split = y, value = Freq)) +
+    ggforce::geom_parallel_sets(aes(fill = Response), alpha = 0.3, axis.width = 0.1) +
+    ggforce::geom_parallel_sets_axes(axis.width = 0.1, color="black", fill="white") +
+    ggforce::geom_parallel_sets_labels(colour = 'black') + 
+    scale_fill_manual(values = c("red", "blue", "darkgreen")) + 
+    theme_cowplot() + 
+    ggforce::theme_no_axes()
+
+  return(list(plot = ggforcePlot, plotDat = plotDat))
+} 
+
+# remove CR and other
+sankey203dat <- merge(absPaired, allCov %>% dplyr::select(subID, Response, Trt), by="subID") %>%
+  dplyr::mutate(Response = ifelse(Response == "CR", "PR", Response)) %>%
+  dplyr::filter(Response != "Other") %>%
+  dplyr::filter(Trt != "FFox" & Trt != "BSC") %>%
+  dplyr::filter(substr(subID, 1, 3) == "203")
+plot_sankey(dat = sankey203dat, shortenLabel = TRUE)$plot
+
+sankey763dat <- merge(absPaired, allCov %>% dplyr::select(subID, Response, Trt), by="subID") %>%
+  dplyr::mutate(Response = ifelse(Response == "CR", "PR", Response)) %>%
+  dplyr::filter(Response != "Other") %>%
+  dplyr::filter(Trt != "FFox" & Trt != "BSC") %>%
+  dplyr::filter(substr(subID, 1, 3) == "763")
+plot_sankey(dat = sankey763dat)$plot
+
+sankey007dat <- merge(absPaired, allCov %>% dplyr::select(subID, Response, Trt), by="subID") %>%
+  dplyr::mutate(Response = ifelse(Response == "CR", "PR", Response)) %>%
+  dplyr::filter(Response != "Other") %>%
+  dplyr::filter(Trt != "FFox" & Trt != "BSC") %>%
+  dplyr::filter(substr(subID, 1, 3) == "007")
+plot_sankey(dat = sankey007dat)$plot
+
+```
+
+
+```{r, Other gains, eval=TRUE, results='show', cache=TRUE, warning=FALSE, message=FALSE,}
+# other genes at baseline
+allBaselineRest <- merge(allCov %>% dplyr::select(subID, Trt), absPaired, by="subID") %>%
+  dplyr::filter(binTime == "Baseline") %>%
+  dplyr::select(-binTime, -paired, -EGFR, -KRAS, -NRAS, -MAP2K1, -BRAF) %>%
+  dplyr::mutate(Study = substr(subID, 1, 3)) %>%
+  dplyr::mutate(antiEGFR = ifelse(Trt == "Pani" | Trt == "Cetux" | Trt == "PaniFFox", 1, 0)) %>%
+  dplyr::arrange(subID) %>%
+  dichot(., colIdx = 3:30)
+allBaselineEGFR <- allBaselineRest %>% filter(antiEGFR == 1)
+allBaselineNonEGFR <- allBaselineRest %>% filter(antiEGFR == 0)
+
+# follow-up
+allFUPRest <- merge(allCov %>% dplyr::select(subID, Trt), absPaired, by="subID") %>%
+  dplyr::filter(binTime == "FUP") %>%
+  dplyr::select(-binTime, -paired, -EGFR, -KRAS, -NRAS, -MAP2K1, -BRAF) %>%
+  dplyr::mutate(antiEGFR = ifelse(Trt == "Pani" | Trt == "Cetux" | Trt == "PaniFFox", 1, 0)) %>%
+  dplyr::arrange(subID) %>%
+  dichot(., colIdx = 3:30) 
+allFUPEGFR <- allFUPRest %>% dplyr::filter(antiEGFR == 1)
+allFUPNonEGFR <- allFUPRest %>% dplyr::filter(antiEGFR == 0)
+
+# additions
+allAddEGFRTemp <- as.data.frame(allFUPEGFR[, 3:30] - allBaselineEGFR[, 3:30]) 
+allAddEGFR <- sapply(allAddEGFRTemp, FUN = function(x) {ifelse(x == 1, x, 0)}) %>%
+    as.data.frame(.) %>% 
+  dplyr::mutate(subID = allBaselineEGFR$subID) %>%
+  dplyr::mutate(Trt = allBaselineEGFR$Trt) %>%
+  dplyr::mutate(Study = allBaselineEGFR$Study) 
+
+allAddNonEGFRTemp <- as.data.frame(allFUPNonEGFR[, 3:30] - allBaselineNonEGFR[, 3:30]) 
+allAddNonEGFR <- sapply(allAddNonEGFRTemp, FUN = function(x) {ifelse(x == 1, x, 0)}) %>%
+    as.data.frame(.) %>% 
+  dplyr::mutate(subID = allBaselineNonEGFR$subID) %>%
+  dplyr::mutate(Trt = allBaselineNonEGFR$Trt) %>%
+  dplyr::mutate(Study = allBaselineNonEGFR$Study) 
+
+# subtractions
+allSubtractEGFRtemp <- as.data.frame(allBaselineEGFR[, 3:30] - allFUPEGFR[, 3:30]) 
+allSubtractEGFR <- sapply(allSubtractEGFRtemp, FUN = function(x) {ifelse(x == 1, x, 0)}) %>%
+    as.data.frame(.) %>% 
+  dplyr::mutate(subID = allBaselineEGFR$subID) %>%
+  dplyr::mutate(Trt = allBaselineEGFR$Trt) %>%
+  dplyr::mutate(Study = allBaselineEGFR$Study) 
+
+allSubtractNonEGFRtemp <- as.data.frame(allBaselineNonEGFR[, 3:30] - allFUPNonEGFR[, 3:30]) 
+allSubtractNonEGFR <- sapply(allSubtractNonEGFRtemp, FUN = function(x) {ifelse(x == 1, x, 0)}) %>%
+    as.data.frame(.) %>% 
+  dplyr::mutate(subID = allBaselineNonEGFR$subID) %>%
+  dplyr::mutate(Trt = allBaselineNonEGFR$Trt) %>%
+  dplyr::mutate(Study = allBaselineNonEGFR$Study) 
+
+# reshape EGFR
+additionDatEGFR <- allAddEGFR %>% 
+  dplyr::select(-subID, -Trt, -Study) %>%
+  pivot_longer(cols = colnames(allAddEGFR)[1:28], names_to="Gene", values_to="Exist")  %>%
+  # could also group by "Studyb" varible in addition to Gene
+  group_by(Gene) %>%
+  summarise(Pct = mean(Exist), x=sum(Exist), n=n()) %>%
+  set_colnames(c("Gene", "AddPct", "x", "n")) %>%
+  dplyr::mutate(CIlowAdd = calcCI(x=x, n=n, high=FALSE)) %>%
+  dplyr::mutate(CIlowAdd = ifelse(CIlowAdd < 0, 0, CIlowAdd)) %>%
+  dplyr::mutate(CIhighAdd = calcCI(x=x, n=n)) %>%
+  dplyr::select(-x, -n)
+subtractionDatEGFR <- allSubtractEGFR %>% 
+  dplyr::select(-subID, -Trt, -Study) %>%
+  pivot_longer(cols = colnames(allSubtractEGFR)[1:28], names_to="Gene", values_to="Exist")  %>%
+  group_by(Gene) %>%
+  summarise(Pct = mean(Exist), x=sum(Exist), n=n()) %>%
+  set_colnames(c("Gene", "SubPct", "x", "n")) %>%
+  dplyr::mutate(CIlowSub = calcCI(x=x, n=n, high=FALSE)) %>%
+  dplyr::mutate(CIlowSub = ifelse(CIlowSub < 0, 0, CIlowSub)) %>%
+  dplyr::mutate(CIhighSub = calcCI(x=x, n=n)) %>%
+  dplyr::select(-x, -n)
+# all changes
+changeDatEGFR <- merge(additionDatEGFR, subtractionDatEGFR, by="Gene")
+
+# reshape data for non-EGFR
+additionDatNonEGFR <- allAddNonEGFR %>% 
+  dplyr::select(-subID, -Trt, -Study) %>%
+  pivot_longer(cols = colnames(allAddNonEGFR)[1:28], names_to="Gene", values_to="Exist")  %>%
+  # could also group by "Studyb" varible in addition to Gene
+  group_by(Gene) %>%
+  summarise(Pct = mean(Exist), x=sum(Exist), n=n()) %>%
+  set_colnames(c("Gene", "AddPct", "x", "n")) %>%
+  dplyr::mutate(CIlowAdd = calcCI(x=x, n=n, high=FALSE)) %>%
+  dplyr::mutate(CIlowAdd = ifelse(CIlowAdd < 0, 0, CIlowAdd)) %>%
+  dplyr::mutate(CIhighAdd = calcCI(x=x, n=n)) %>%
+  dplyr::select(-x, -n)
+subtractionDatNonEGFR <- allSubtractNonEGFR %>% 
+  dplyr::select(-subID, -Trt, -Study) %>%
+  pivot_longer(cols = colnames(allSubtractNonEGFR)[1:28], names_to="Gene", values_to="Exist")  %>%
+  # could also group by "Studyb" varible in addition to Gene
+  group_by(Gene) %>%
+  summarise(Pct = mean(Exist), x=sum(Exist), n=n()) %>%
+  set_colnames(c("Gene", "SubPct", "x", "n")) %>%
+  dplyr::mutate(CIlowSub = calcCI(x=x, n=n, high=FALSE)) %>%
+  dplyr::mutate(CIlowSub = ifelse(CIlowSub < 0, 0, CIlowSub)) %>%
+  dplyr::mutate(CIhighSub = calcCI(x=x, n=n)) %>%
+  dplyr::select(-x, -n)
+changeDatNonEGFR <- merge(additionDatNonEGFR, subtractionDatNonEGFR, by="Gene")
+
+# combine
+combinedChangeDat <- rbind(changeDatNonEGFR %>% mutate(Trt = "NonEGFR"),
+                           changeDatEGFR %>% mutate(Trt = "EGFR")) %>%
+  mutate(NetPct = AddPct - SubPct)
+
+#-----------------------------------------------------------------------------------#
+# To get the numbers for any resistance mutation
+changeDat1L <- output1a$changeDat %>%
+  dplyr::select(subID, Any)
+changeDat3L <- output1b$changeDat %>%
+  dplyr::select(subID, Any)
+changeDat <- rbind(changeDat1L, changeDat3L)
+
+# to get total number of other mutations
+lastPlotDatEGFR <- allAddEGFR %>% dplyr::select(-subID, -Trt, -Study) %>%
+  dplyr::mutate(Tot = rowSums(.)) %>%
+  dplyr::mutate(subID = allAddEGFR$subID) %>%
+  merge(., changeDat %>% dplyr::select(subID, Any), by="subID") %>%
+  dplyr::mutate(Treatment = "EGFR")
+lastPlotDatNonEGFR <- allAddNonEGFR %>% dplyr::select(-subID, -Trt, -Study) %>%
+  mutate(Tot = rowSums(.)) %>%
+  mutate(subID = allAddNonEGFR$subID) %>%
+  # we only need the Any column for the EGFR subset
+  mutate(Any = 0) %>%
+  mutate(Treatment = "non-EGFR")
+lastPlotDat <- rbind(lastPlotDatEGFR, lastPlotDatNonEGFR)
+
+# plot
+boxplotByTrt <- ggplot(lastPlotDat, aes(x=Treatment, y=Tot, fill=Treatment))  +
+  geom_boxplot(alpha = 0.7) +
+  scale_x_discrete(name = "Treatment") + 
+  ylab("Total Number of Mutations") + 
+  scale_fill_manual(values=c("red", "blue"), name="Treatment") + 
+  scale_y_continuous(breaks=c(2,4,6,8,10)) + 
+  theme_cowplot()
+boxplotByTrt
+mean(lastPlotDatEGFR$Tot)
+mean(lastPlotDatNonEGFR$Tot)
+# means are 0.6 and 0.4
+
+boxplotByAcqRes <- ggplot(lastPlotDatEGFR, aes(x=as.factor(Any), y=Tot, fill=as.factor(Any)))  +
+  geom_boxplot(alpha = 0.7) +
+  ylab("Total Number of Mutations") + 
+  scale_x_discrete(name = "Named Mutation", labels=c("Not Present", "Present")) + 
+  scale_fill_manual(values=c("red", "blue"), name="Named Mutation", labels=c("Not Present", "Present")) + 
+  scale_y_continuous(breaks=c(2,4,6,8,10)) + 
+  theme_cowplot()
+mean(lastPlotDatEGFR %>% filter(Any == 1) %>% dplyr::select(Tot) %>% unlist(.))
+mean(lastPlotDatEGFR %>% filter(Any == 0) %>% dplyr::select(Tot) %>% unlist(.))
+
+```
+
+
+# Analysis of subclonal baseline mutations
+
+```{r, Subclonal baseline mutations, eval=FALSE, results='show', message=FALSE, cache=TRUE, warning=FALSE}
+
+# EGFR rmaf and abs matrices
+rmafEGFR <- merge(rmafPaired,
+                allCov %>% dplyr::select(subID, EGFRi), by="subID") %>%
+  dplyr::filter(EGFRi == 1)
+absEGFR <- merge(absPaired,
+                allCov %>% dplyr::select(subID, EGFRi), by="subID") %>%
+  dplyr::filter(EGFRi == 1)
+allSubs <- unique(rmafEGFR$subID)
+
+# resistance mutations
+resistVec <- c("KRAS", "NRAS", "EGFR", "BRAF", "MAP2K1")
+
+# count at a mutation level (only going to be subclonal mutations at baseline)
+countMutDF <- data.frame(Gene = colnames(rmafEGFR)[4:36], 
+                    Up=0, Down=0, subToClonal=0, subToSub=0, subToAbsent=0, subToDominant=0, Total=0)
+
+# count at a subject level (only going to be subclonal mutations at baseline)
+countSubDF <- data.frame(Gene = c("Any", "Resistance") ,
+                    Up=0, Down=0, subToClonal=0, subToSub=0, subToAbsent=0, subToDominant=0, Total=0)
+
+# holds the freqs for median of resistance muts in baseline
+rmafsSubclonalVec <- c()
+absSubclonalVec <- c()
+
+# loop through all subjects
+for (sub_it in 1:length(allSubs)) {
+  tempDat <- rmafEGFR %>% dplyr::filter(subID == allSubs[sub_it]) %>% dplyr::arrange(binTime) %>%
+    dplyr::select(-subID, -binTime, -paired, -EGFRi)
+  tempDatAbs <- absEGFR %>% dplyr::filter(subID == allSubs[sub_it]) %>% dplyr::arrange(binTime) %>%
+    dplyr::select(-subID, -binTime, -paired, -EGFRi)
+  tempDatResistance <- tempDat %>% dplyr::select(EGFR, NRAS, KRAS, MAP2K1, BRAF) %>% slice(1) %>% as.numeric()
+  tempDatResistanceAbs <- tempDatAbs %>% dplyr::select(EGFR, NRAS, KRAS, MAP2K1, BRAF) %>% slice(1) %>% as.numeric()
+ 
+  whichPlus <- which(tempDat[1, ] > 0 & tempDat[1, ] <= 0.25 & tempDat[2, ] > tempDat[1, ])
+  whichMinus <- which(tempDat[1, ] > 0 & tempDat[1, ] <= 0.25 & tempDat[2, ] < tempDat[1, ])
+  whichTotal <- which(tempDat[1, ] > 0 & tempDat[1, ] <= 0.25 )
+  whichSubToClonal <- which(tempDat[1, ] > 0 & tempDat[1, ] <= 0.25 & tempDat[2, ] > 0.25)
+  whichSubToSub  <- which(tempDat[1, ] > 0 & tempDat[1, ] <= 0.25 & tempDat[2, ] > 0 & tempDat[2, ] <= 0.25)
+  whichSubToAbsent <- which(tempDat[1, ] > 0 & tempDat[1, ] <= 0.25 & tempDat[2, ] == 0)
+  whichSubToDominant <- which(tempDat[1, ] > 0 & tempDat[1, ] <= 0.25 & tempDat[2, ] == 1)
+  
+  # add freqs
+  rmafsSubclonalVec <- c(rmafsSubclonalVec, tempDatResistance[which(tempDatResistance > 0 & tempDatResistance <= 0.25)])
+  absSubclonalVec <- c(absSubclonalVec, tempDatResistanceAbs[which(tempDatResistance > 0 & tempDatResistance <= 0.25)])
+
+  # count
+  if (length(whichPlus) > 0) {
+    countMutDF$Up[whichPlus] <- countMutDF$Up[whichPlus] + 1 
+    countSubDF$Up[1] <- countSubDF$Up[1] + 1
+    if (length(which(countMutDF$Gene[whichPlus] %in% resistVec)) > 0) {
+      countSubDF$Up[2] <- countSubDF$Up[2] + 1
+    }
+  }
+  if (length(whichMinus) > 0) {
+    countMutDF$Down[whichMinus] <- countMutDF$Down[whichMinus] + 1 
+    countSubDF$Down[1] <- countSubDF$Down[1] + 1
+    if (length(which(countMutDF$Gene[whichMinus] %in% resistVec)) > 0) {
+      countSubDF$Down[2] <- countSubDF$Down[2] + 1
+    }
+  }
+  if (length(whichTotal) > 0) {
+    countMutDF$Total[whichTotal] <- countMutDF$Total[whichTotal] + 1 
+    countSubDF$Total[1] <- countSubDF$Total[1] + 1 
+    if (length(which(countMutDF$Gene[whichTotal] %in% resistVec)) > 0) {
+      countSubDF$Total[2] <- countSubDF$Total[2] + 1
+    }
+  }
+  if (length(whichSubToClonal) > 0) {
+    countMutDF$subToClonal[whichSubToClonal] <- countMutDF$subToClonal[whichSubToClonal] + 1 
+    countSubDF$subToClonal[1] <- countSubDF$subToClonal[1] + 1 
+    if (length(which(countMutDF$Gene[whichSubToClonal] %in% resistVec)) > 0) {
+      countSubDF$subToClonal[2] <- countSubDF$subToClonal[2] + 1
+    }
+  }
+  
+  if (length(whichSubToSub) > 0) {
+    countMutDF$subToSub[whichSubToSub] <- countMutDF$subToSub[whichSubToSub] + 1 
+    countSubDF$subToSub[1] <- countSubDF$subToSub[1] + 1 
+    if (length(which(countMutDF$Gene[whichSubToSub] %in% resistVec)) > 0) {
+      countSubDF$subToSub[2] <- countSubDF$subToSub[2] + 1
+    }
+  }
+  
+  if (length(whichSubToDominant) > 0) {
+    countMutDF$subToDominant[whichSubToDominant] <- countMutDF$subToDominant[whichSubToDominant] + 1 
+    countSubDF$subToDominant[1] <- countSubDF$subToDominant[1] + 1 
+    
+    if (length(which(countMutDF$Gene[whichSubToDominant] %in% resistVec)) > 0) {
+      countSubDF$subToDominant[2] <- countSubDF$subToDominant[2] + 1
+    }
+  }
+  
+  if (length(whichSubToAbsent) > 0) {
+    countMutDF$subToAbsent[whichSubToAbsent] <- countMutDF$subToAbsent[whichSubToAbsent] + 1 
+    countSubDF$subToAbsent[1] <- countSubDF$subToAbsent[1] + 1 
+    if (length(which(countMutDF$Gene[whichSubToAbsent] %in% resistVec)) > 0) {
+      countSubDF$subToAbsent[2] <- countSubDF$subToAbsent[2] + 1
+    }
+  }
+}
+
+# analysis
+sum(countMutDF$Total) # 864 total subclonal mutations at baseline
+resistMutDF <- countMutDF %>%
+  filter(Gene %in% resistVec)
+sum(resistMutDF$Total)  # 171 total resistance mutations
+sum(resistMutDF$subToClonal) / sum(resistMutDF$Total)   # 13, 7.6% become clonal
+sum(resistMutDF$subToSub) / sum(resistMutDF$Total)   # 75. 43.9% stay subclonal
+sum(resistMutDF$subToAbsent) / sum(resistMutDF$Total)   # 83, 48.5% go absent
+sum(resistMutDF$subToDominant) / sum(resistMutDF$Total)   #2,  1.2% become dominant
+
+countSubDF      # 296 out of 472 EGFR have a mutation, 129 have a resistance mutation
+
+# median freq of resistance subclonal mutations at baseline
+median(rmafsSubclonalVec)
+median(absSubclonalVec)
+
+```
+
+
+
+# All numbers combined
+
+```{r, check all numbers, eval=FALSE, results='show', cache=TRUE, warning=FALSE, message=FALSE,}
+
+# how many in each study with paired data
+table(absPaired %>% filter(binTime == "Baseline") %>% dplyr::select(subID) %>% unlist(.) %>% substr(., 1, 3))
+
+# for 203 how many with resistance MT comparing EGFRi and non
+datFig1a <- absPaired %>% mutate(Group = substr(subID, 1, 3)) %>%
+  filter(Group == "203") %>%
+  mutate(Group = "1L, 203 study") %>%
+  merge(., allCov %>% dplyr::select(subID, EGFRi), by="subID") %>%
+  filter(EGFRi == 1)
+output1a <- plot_acquired(dat = datFig1a, legLabs = c("1L, 203 study"), ylimits=c(0, 0.6),
+                          plotCols = c("green", "darkgreen"), legTitle = "Study")
+output1a$tab
+
+datFig1aNon <- absPaired %>% mutate(Group = substr(subID, 1, 3)) %>%
+  filter(Group == "203") %>%
+  mutate(Group = "1L, 203 study") %>%
+  merge(., allCov %>% dplyr::select(subID, EGFRi), by="subID") %>%
+  filter(EGFRi == 0)
+output1aNon <- plot_acquired(dat = datFig1aNon, legLabs = c("1L, 203 study"), ylimits=c(0, 0.6),
+                          plotCols = c("green", "darkgreen"), legTitle = "Study")
+output1aNon$tab
+4/70
+7/77
+x <- matrix(data=c(4, 66, 7, 70), nrow=2)
+fisher.test(x)
+
+
+# for 007 (763 is all EGFRi)
+dat007 <- absPaired %>% mutate(Group = substr(subID, 1, 3)) %>%
+  filter(Group == "007") %>%
+  mutate(Group = "1L, 763s study")  %>%
+  merge(., allCov %>% dplyr::select(subID, EGFRi), by="subID") %>%
+  filter(EGFRi == 1)
+output007 <- plot_acquired(dat = dat007, legLabs = c("1L, 203 study"), ylimits=c(0, 0.6),
+                          plotCols = c("green", "darkgreen"), legTitle = "Study")
+output007$tab
+
+dat007Non <- absPaired %>% mutate(Group = substr(subID, 1, 3)) %>%
+  filter(Group == "007") %>%
+  mutate(Group = "3L, 007 study")  %>%
+  merge(., allCov %>% dplyr::select(subID, EGFRi), by="subID") %>%
+  filter(EGFRi == 0)
+output007Non <- plot_acquired(dat = dat007Non, legLabs = c("3L, 007 study"), ylimits=c(0, 0.6),
+                          plotCols = c("green", "darkgreen"), legTitle = "Study")
+output007Non$tab
+
+25/64
+x <- matrix(data=c(0, 27, 25, 39), nrow=2)
+fisher.test(x)
+
+# 763 percentage 
+dat007 <- absPaired %>% mutate(Group = substr(subID, 1, 3)) %>%
+  filter(Group == "763") %>%
+  mutate(Group = "3L, 763 study")  %>%
+  merge(., allCov %>% dplyr::select(subID, EGFRi), by="subID") %>%
+  filter(EGFRi == 1)
+output007 <- plot_acquired(dat = dat007, legLabs = c("#L, 763 study"), ylimits=c(0, 0.6),
+                          plotCols = c("green", "darkgreen"), legTitle = "Study")
+output007$tab
+156 / 331
+
+# for combined 007 and 763
+datComb <- absPaired %>% mutate(Group = substr(subID, 1, 3)) %>%
+  filter(Group == "007" | Group == "763") %>%
+  mutate(Group = ifelse(Group == "007", "3L, 007 study", "3L, 763 study")) %>%
+  merge(., allCov %>% dplyr::select(subID, EGFRi), by="subID") %>%
+  filter(EGFRi == 1)
+outputComb <- plot_acquired(dat = datComb, legLabs = c("3L, 007 study", "3L, 763 study"), ylimits=c(0, 0.6),
+                          plotCols = c("plum2", "darkorchid4","steelblue2","navyblue"), legTitle = "Study")
+outputComb$tab
+181 / 395
+x <- matrix(data=c(0, 27,181, 214), nrow=2)
+fisher.test(x)
+
+# comparing EGFRi between 1L and 3L
+x <- matrix(data=c(7, 70, 181, 214), nrow=2)
+fisher.test(x)
+
+
+# sankey
+sankey203dat <- merge(absPaired, allCov %>% dplyr::select(subID, Response, Trt), by="subID") %>%
+  mutate(Response = ifelse(Response == "CR", "PR", Response)) %>%
+  filter(Response != "Other") %>%
+  filter(Trt != "FFox" & Trt != "BSC") %>%
+  filter(substr(subID, 1, 3) == "203")
+plot_sankey(dat = sankey203dat)$plotDat
+# have non PD and a mutation on EGFRi
+6 /67
+# have PD and a mutation on EGFRi
+1 / 8
+x <- matrix(data=c(6, 61, 1, 7), nrow=2)
+fisher.test(x)
+
+sankey3Ldat <- merge(absPaired, allCov %>% dplyr::select(subID, Response, Trt), by="subID") %>%
+  dplyr::mutate(Response = ifelse(Response == "CR", "PR", Response)) %>%
+  dplyr::filter(Response != "Other") %>%
+  dplyr::filter(Trt != "FFox" & Trt != "BSC") %>%
+  dplyr::filter(substr(subID, 1, 3) == "763" | substr(subID, 1, 3) == "007")
+plot_sankey(dat = sankey3Ldat)$plotDat
+# have non PD and a mutation on EGFRi
+147 / 299
+# have PD and a mutation on EGFRi
+34 / 96
+x <- matrix(data=c(147, 152, 34, 62), nrow=2)
+fisher.test(x)
+
+# long short PFS
+# long is 4 months, defined by clinicians
+datFig4a <- merge(absPaired, allCov %>% mutate(TrtDur = TrtEnd - TrtStart) %>%
+                  dplyr::mutate(Study = substr(subID, 1, 3)) %>% filter(Study == "203") %>%
+                  dplyr::select(subID, TrtDur, EGFRi), by="subID") %>%
+  filter(EGFRi == 1) %>%
+  dplyr::mutate(PFSbin = ifelse(TrtDur >= 122, 1, 0)) %>%
+  mutate(Group = ifelse(PFSbin == 1, "Long PFS", "Short PFS")) 
+
+output4a <- plot_acquired(dat = datFig4a, legLabs = c("Long PFS", "Short PFS"), ylimits=c(0, 0.6),
+                          plotCols = c("blue", "darkblue", "red", "red4"), legTitle = "Survival")
+output4a$tab
+# short PFS
+1/23
+# long PFS
+6/54
+x <- matrix(data=c(1, 22, 6, 48), nrow=2)
+fisher.test(x)
+
+
+datFig4b <- merge(absPaired, allCov %>% mutate(TrtDur = TrtEnd - TrtStart) %>%
+                  dplyr::mutate(Study = substr(subID, 1, 3)) %>% filter(Study != "203") %>%
+                  dplyr::select(subID, TrtDur, EGFRi), by="subID") %>%
+  filter(EGFRi == 1) %>%
+  dplyr::mutate(PFSbin = ifelse(TrtDur >= 122, 1, 0)) %>%
+  mutate(Group = ifelse(PFSbin == 1, "Long PFS", "Short PFS")) 
+
+output4b <- plot_acquired(dat = datFig4b, legLabs = c("Long PFS", "Short PFS"), ylimits=c(0, 0.6),
+                          plotCols = c("blue", "darkblue", "red", "red4"), legTitle = "Survival")
+output4b$tab
+# short PFS
+67/178
+# long PFS
+114/217
+x <- matrix(data=c(67,117,114,103), nrow=2)
+fisher.test(x)
+
+```
+
+

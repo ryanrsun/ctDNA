@@ -1,0 +1,497 @@
+---
+title: "Code to Reproduce Analysis in Parseghian, Sun, Woods, et al."
+author: ''
+date: ''
+output:
+  pdf_document: default
+  word_document: default
+geometry: margin=1in
+classoption: portrait
+---
+    
+<!-- SHIFT + Command + c to comment out blocks of text like this! -->
+
+```{r setup, include=FALSE}
+
+knitr::opts_chunk$set(echo = FALSE)
+options(stringsAsFactors = FALSE)
+library(survival)
+library(surv2sampleComp)
+library(survRM2)
+library(survminer)
+library(tidyverse)
+library(magrittr)
+library(data.table)
+library(sas7bdat)
+library(ggplot2)
+library(cowplot)
+
+LOD <- 0.1
+
+```
+
+```{r, prepare 203, warning=FALSE, cache=FALSE, eval=TRUE, message=FALSE, results='hide'}
+
+#----------------------------------#
+# read 203 covariates, rename the columns
+dir203 <- '/users/rsun3/box/aaawork/collabs/202009_parseghian_amgen/pmab_mdanderson/20050203'
+setwd(dir203)
+cov203 <- read.sas7bdat("mdanderson_20050203.sas7bdat") %>%
+  set_colnames(c("subID", "Age", "Race", "Trt", "TrtA", "Loc", "LivOnly", "PriorL", "TrtStart", "TrtEnd",
+                 "Response", "Death", "DeathDay")) %>%
+  mutate(subID = as.character(subID)) %>%
+  dplyr::mutate(Race = as.character(Race)) %>%
+  dplyr::mutate(Response = as.character(Response)) %>%
+  dplyr::mutate(Loc = as.character(Loc)) %>%
+  dplyr::mutate(Trt = as.character(Trt)) %>%
+  mutate(subID = str_remove(subID, "^0+")) %>%
+  mutate(subID = as.numeric(subID)) %>%
+  mutate(Response = ifelse(Response %in% c("ND", "UE"), "Other", Response)) %>%
+  mutate(Trt = ifelse(Trt == "FOLFOX alone", "FFox", "PaniFFox"))
+
+# read 203 sheet 1
+somat1b203 <- fread("20180014_Amgen_Ang_Batch1_PlasmaSELECT-64_Integrated_Report_14MAR2019_s3.csv", skip=5L, select=c(1,2,3,8,9,10,11,13)) %>% 
+  set_colnames(c("PGID", "altID", "Gene", "AA", "Exon", "Type", "Conseqeunce", "cMAF")) %>%
+  filter(PGID != "") %>%
+  mutate(ncharMAF = nchar(cMAF)) %>%
+  mutate(MAF = substr(cMAF, 1, ncharMAF-1)) %>%
+  mutate(MAF = as.numeric(MAF))
+somat2b203 <- fread("20180014_Amgen_Ang Batch 2 PlasmaSELECT-64 Integrated Report 17JUN2019_s3.csv", skip=6L, select=c(1,2,3,8,9,10,11, 13)) %>% 
+  set_colnames(c("PGID", "altID", "Gene", "AA", "Exon", "Type", "Conseqeunce", "cMAF")) %>%
+  filter(PGID != "") %>%
+  mutate(ncharMAF = nchar(cMAF)) %>%
+  mutate(MAF = substr(cMAF, 1, ncharMAF-1)) %>%
+  mutate(MAF = as.numeric(MAF))
+
+# QC sheet - lots of fails, it also connects the sample_alias and visit number to PGDXID
+qcSheet <- fread("pmab20050203_PlasmaSELECT_QC_report.csv", select=c(1, 3,4,8,9)) %>%
+  set_colnames(c("PGID", "altID", "Visit", "QC", "subID")) %>%
+  filter(PGID != "")
+
+# put together the QC sheet with the two somatic mutations sheets
+somat203ps <- rbind(somat1b203, somat2b203) %>%
+  data.frame(.) %>%
+  merge(., qcSheet, by=c("PGID")) %>% 
+  filter(QC == "Pass") %>% 
+  mutate(binTime = ifelse(Visit == "C1D1", "Baseline", "FUP")) %>%
+  dplyr::select(-altID.x, -altID.y, -Exon, -PGID, -Conseqeunce, -cMAF, -ncharMAF, -QC)
+
+# there are some PGID in the QC sheet not in the somatic mutations sheet, and 14 of them
+# have subID that are in the somatic mutations sheet - so these are real 0s
+zeroMuts203 <- rbind(somat1b203, somat2b203) %>%
+  merge(., qcSheet, by=c("PGID"), all.y = TRUE) %>% 
+  dplyr::filter(QC == "Pass") %>% 
+  mutate(binTime = ifelse(Visit == "C1D1", "Baseline", "FUP")) %>%
+  dplyr::filter(is.na(Gene)) %>%
+  dplyr::select(-altID.x, -altID.y, -Exon, -PGID, -Conseqeunce, -cMAF, -ncharMAF, -QC) %>%
+  dplyr::filter(subID %in% somat203ps$subID) %>%
+  dplyr::mutate(Gene = "NONE", AA = "NONE", Type = "NONE", MAF = 0)
+
+# ResBio data is in cov203 but not QC table, so have to add it after merging with QC sheet
+# remember to multiply the MAF by 100
+somatResBio <- fread("pmab20050203_ResBio.csv", select=c(5,8,9,13,18)) %>%
+  set_colnames(c("Visit", "Type", "Mutation", "MAF", "subID")) %>%
+  dplyr::filter(Type != "CNV" & Type != "no reported mutations") %>%
+  dplyr::mutate(spaceChar = gregexpr(" ", text = Mutation)) %>%
+  dplyr::mutate(Gene = substr(Mutation, 1, as.numeric(spaceChar) - 1)) %>%
+  dplyr::mutate(AA = substr(Mutation, as.numeric(spaceChar) + 1, nchar(Mutation))) %>%
+  dplyr::mutate(binTime = ifelse(Visit == "C1D1", "Baseline", "FUP")) %>% 
+  dplyr::select(Gene, AA, Type, MAF, Visit, subID, binTime) %>%
+  dplyr::mutate(MAF = MAF * 100)
+
+# need to add the no mutations people - with the fake gene NONE
+# these were missing before
+noMutResBio <- fread("pmab20050203_ResBio.csv", select=c(5,8,9,13,18)) %>%
+  set_colnames(c("Visit", "Type", "Mutation", "MAF", "subID")) %>%
+    dplyr::filter(Type == "no reported mutations") %>%
+    dplyr::mutate(Gene = "NONE") %>%
+    dplyr::mutate(AA = "NONE") %>%
+    dplyr::mutate(binTime = ifelse(Visit == "C1D1", "Baseline", "FUP")) %>% 
+    dplyr::select(Gene, AA, Type, MAF, Visit, subID, binTime) %>%
+    dplyr::mutate(MAF = 0)
+
+# all 203 data
+# just filter out MAFs between 0 and 0.1, those are below LOD
+somat203 <- rbind(somat203ps, zeroMuts203, somatResBio, noMutResBio) %>%
+  dplyr::filter(subID %in% cov203$subID) %>%
+  dplyr::filter(!(MAF > 0 & MAF < LOD))
+
+# filter the covariate data to those in somat203
+cov203 <- cov203 %>% filter(subID %in% somat203$subID) %>%
+  dplyr::mutate(Study = "s203") 
+
+# save the data
+# setwd('/users/rsun3/desktop')
+# write.table(somat203, "mutations203.txt", append=F, quote=F, row.names=F, col.names=T, sep='\t')
+# write.table(cov203, "covariates203.txt", append=F, quote=F, row.names=F, col.names=T, sep='\t')
+
+# a check to make sure each subject has at most two timepoints 
+# time203 <- somat203 %>% 
+#  dplyr::select(subID, binTime) %>% distinct()
+# table(time203$subID)
+# length(which(table(time203$subID) == 2)) # 147 subjects with paired data
+
+#dim(somat203)  # 1052 mutations
+#dim(somat203 %>% filter(binTime == "Baseline")) # 585 mutations in baseline
+#dim(somat203 %>% filter(binTime == "FUP")) # 467 mutations in FUP
+#length(unique(somat203$subID)) # 201 subjects
+#length(which(unique(somat203$subID) %in% cov203$subID))
+```
+
+```{r, read 007, warning=FALSE, cache=FALSE, eval=TRUE, message=FALSE, results='hide'}
+
+# 007 is all 3L
+setwd('/users/rsun3/box/aaawork/collabs/202009_parseghian_amgen/pmab_mdanderson/20100007')
+cov007 <- read.sas7bdat("mdanderson_20100007.sas7bdat") %>%
+  set_colnames(c("subID", "Age", "Race", "Trt", "TrtA", "Loc", "LiverMet", "PriorL", "TrtStart", 
+                 "TrtEnd", "Response", "Death", "DeathDay")) %>%
+  dplyr::mutate(subID = as.character(subID)) %>%
+  dplyr::mutate(subID = str_remove(subID, "^0+")) %>%
+  dplyr::mutate(subID = as.numeric(subID)) %>%
+  dplyr::mutate(Race = as.character(Race)) %>%
+  dplyr::mutate(Response = as.character(Response)) %>%
+  dplyr::mutate(Loc = as.character(Loc)) %>%
+  dplyr::mutate(Trt = as.character(Trt)) %>%
+  dplyr::mutate(Race = ifelse(Race == "WHITE", "White", Race)) %>%
+  dplyr::mutate(Race = ifelse(Race == "ASIAN", "Asian", Race)) %>%
+  dplyr::mutate(Race = ifelse(Race == "OTHER", "Other", Race)) %>%
+  dplyr::mutate(Race = ifelse(Race == "AMERICAN INDIAN OR ALASKA NATIVE", "NatAm", Race)) %>%
+  dplyr::mutate(Response = ifelse(Response == "PARTIAL RESPONSE", "PR", Response)) %>%
+  dplyr::mutate(Response = ifelse(Response == "PROGRESSIVE DISEASE", "PD", Response)) %>%
+  dplyr::mutate(Response = ifelse(Response == "STABLE DISEASE OR NON-COMPLETE RESPONSE/NON-PROGRESSIVE DISEASE", "SD", Response)) %>%
+  dplyr::mutate(Response = ifelse(Response == "NOT DONE", "Other", Response)) %>%
+  dplyr::mutate(Response = ifelse(Response == "NOT EVALUABLE", "Other", Response)) %>%
+  dplyr::filter(Loc != "") %>%
+  dplyr::mutate(Loc = ifelse(Loc == "NEOPLASM, COLON", "Colon", "Rectal")) %>%
+  dplyr::mutate(Trt = ifelse(Trt == "Best supportive care", "BSC", "Pani"))
+  
+# you have to match the Alternate ID with the "inventory" file to get the visit number
+# there doesn't appear to be a QC for this one
+# three versions of sheet 3
+somat1b007 <- fread("20170111_Amgen_Ang_Batch1 PlasmaSELECT R64 Integrated Report (Amended2) 20SEP2018_s3.csv", skip=6L, select=c(1,2,3,8,9,10,11, 13)) %>% 
+  set_colnames(c("PGID", "altID", "Gene", "AA", "Exon", "Type", "Consequence", "cMAF")) %>%
+  dplyr::filter(PGID != "") %>%
+  dplyr::mutate(ncharMAF = nchar(cMAF)) %>%
+  dplyr::mutate(MAF = substr(cMAF, 1, ncharMAF-1)) %>%
+  dplyr::mutate(MAF = as.numeric(MAF))
+somat2b007 <- fread("20170111_Amgen_Ang_Batch2 PlasmaSELECT R64 Integrated Report (Amended) 19SEP2018_s3.csv", skip=5L, select=c(1,2,3,8,9,10,11, 13)) %>% 
+  set_colnames(c("PGID", "altID", "Gene", "AA", "Exon", "Type", "Consequence", "cMAF")) %>%
+  dplyr::filter(PGID != "") %>%
+  dplyr::mutate(ncharMAF = nchar(cMAF)) %>%
+  dplyr::mutate(MAF = substr(cMAF, 1, ncharMAF-1)) %>%
+  dplyr::mutate(MAF = as.numeric(MAF))
+somat3b007 <- fread("20170111_Amgen_Ang_Batch3 PlasmaSELECT R64 Integrated Report 24AUG2018_s3.csv", skip=6L, select=c(1,2,3,8,9,10,11, 13)) %>% 
+  set_colnames(c("PGID", "altID", "Gene", "AA", "Exon", "Type", "Consequence", "cMAF")) %>%
+  dplyr::filter(PGID != "") %>%
+  dplyr::mutate(ncharMAF = nchar(cMAF)) %>%
+  dplyr::mutate(MAF = substr(cMAF, 1, ncharMAF-1)) %>%
+  dplyr::mutate(MAF = as.numeric(MAF))
+
+# look at the sample sheets to see who might have had 0 mutations
+sample0071 <- fread("20170111_Amgen_Ang_Batch1 PlasmaSELECT R64 Integrated Report (Amended2) 20SEP2018_s1.csv", skip=6L, select=c(2, 3)) %>%
+  set_colnames(c("PGID", "altID"))
+sample0072 <- fread("20170111_Amgen_Ang_Batch2 PlasmaSELECT R64 Integrated Report (Amended) 19SEP2018_s1.csv", skip=6L, select=c(1, 2)) %>%
+  set_colnames(c("PGID", "altID"))
+sample0073 <- fread("20170111_Amgen_Ang_Batch3 PlasmaSELECT R64 Integrated Report 24AUG2018_s1.csv", skip=6L, select=c(2, 3)) %>%
+  set_colnames(c("PGID", "altID"))
+# the no mutations from 007
+zeroSamps007 <- rbind(sample0071, sample0072, sample0073) %>%
+  dplyr::mutate(Gene = "NONE", AA="NONE", MAF = 0) %>%
+  dplyr::filter(PGID != "") %>%
+  dplyr::filter(!(altID %in% somat1b007$altID) & !(altID %in% somat2b007$altID) & !(altID %in% somat3b007$altID)) %>%
+  dplyr::mutate(altID = as.character(altID))
+
+# put together the visit time sheet with the two somatic mutations sheets
+inventory <- fread("pmab200100007_inventory.csv", select=c(2, 5, 6, 7)) %>%
+  set_colnames(c("SampleType", "subID", "altID", "Visit")) %>%
+  dplyr::filter(SampleType == "PLASMA") %>%
+  distinct()
+somat007_123 <- rbind(somat1b007, somat2b007, somat3b007) %>%
+  dplyr::mutate(altID = as.character(altID)) %>%
+  merge(., inventory, by=c("altID")) %>% 
+  dplyr::filter(Visit %in% c("W1PRE_DOS_ST", "FU")) %>%
+  dplyr::mutate(binTime = ifelse(Visit == "W1PRE_DOS_ST", "Baseline", "FUP")) %>%
+  dplyr::filter(MAF > LOD)
+# add no mutations
+noMut007 <- inventory %>% merge(., zeroSamps007, by="altID") %>%
+  dplyr::filter(Visit %in% c("W1PRE_DOS_ST", "FU")) %>%
+  dplyr::select(altID, PGID, subID, Visit, SampleType) %>%
+  dplyr::distinct()
+somat007 <- rbind(somat007_123,
+                  noMut007 %>% dplyr::mutate(Gene = "NONE", AA = "NONE", Exon = "NONE", Type = "NONE",
+                                      Consequence = "NONE", cMAF = "0%", ncharMAF = 2, MAF = 0,
+                                      binTime = ifelse(Visit == "FU", "FUP", "Baseline")))
+           
+# filter the covariate data to those in somat007
+cov007 <- cov007 %>% filter(subID %in% somat007$subID) %>%
+  dplyr::mutate(Study = "s007")
+
+# save the data
+# setwd('/users/rsun3/desktop')
+# write.table(somat007, "mutations007.txt", append=F, quote=F, row.names=F, col.names=T, sep='\t')
+# write.table(cov007, "covariates007.txt", append=F, quote=F, row.names=F, col.names=T, sep='\t')
+
+# a check to make sure each subject has at most two timepoints 
+# time007 <- somat007 %>% 
+#  dplyr::select(subID, binTime) %>% distinct()
+# table(time007$subID)
+# length(which(table(time007$subID) == 2)) # 91 subjects with paired data
+
+#dim(somat007)  # 1001 mutations
+#dim(somat007 %>% filter(binTime == "Baseline")) # 427 mutations in baseline
+#dim(somat007 %>% filter(binTime == "FUP")) # 574 mutations in FUP
+#length(unique(somat007$subID)) # 113 subjects
+#length(which(unique(somat007$subID) %in% cov007$subID))
+
+```
+
+```{r, read 763, warning=FALSE, cache=FALSE, eval=TRUE, message=FALSE, results='hide'}
+
+# last study is 763 from 2008 (203 is 2005 and 007 is 2010)
+setwd('/users/rsun3/box/aaawork/collabs/202009_parseghian_amgen/pmab_mdanderson/20080763')
+cov763 <- read.sas7bdat("mdanderson_20080763.sas7bdat") %>%
+  set_colnames(c("subID", "Age", "Race", "Trt", "TrtA", "Loc", "LiverMet", "PriorL", "TrtStart", 
+                 "TrtEnd", "Response", "Death", "DeathDay")) %>%
+  dplyr::mutate(subID = as.character(subID)) %>%
+  dplyr::mutate(subID = str_remove(subID, "^0+")) %>%
+  dplyr::mutate(subID = as.numeric(subID)) %>%
+  dplyr::mutate(Race = as.character(Race)) %>%
+  dplyr::mutate(Response = as.character(Response)) %>%
+  dplyr::mutate(Loc = as.character(Loc)) %>%
+  dplyr::mutate(Trt = as.character(Trt)) %>%
+  dplyr::mutate(Race = ifelse(Race == "WHITE OR CAUCASIAN", "White", Race)) %>%
+  dplyr::mutate(Race = ifelse(Race == "ASIAN", "Asian", Race)) %>%
+  dplyr::mutate(Race = ifelse(Race == "OTHER", "Other", Race)) %>%
+  dplyr::mutate(Race = ifelse(Race == "HISPANIC OR LATINO", "HispanicLatino", Race)) %>%
+  dplyr::mutate(Race = ifelse(Race == "BLACK OR AFRICAN AMERICAN", "Black", Race)) %>%
+  dplyr::mutate(Race = ifelse(Race == "JAPANESE", "Asian", Race)) %>%
+  dplyr::mutate(Response = ifelse(Response == "COMPLETE RESPONSE", "CR", Response)) %>%
+  dplyr::mutate(Response = ifelse(Response == "PARTIAL RESPONSE", "PR", Response)) %>%
+  dplyr::mutate(Response = ifelse(Response == "PROGRESSIVE DISEASE", "PD", Response)) %>%
+  dplyr::mutate(Response = ifelse(Response == "STABLE DISEASE OR NON-COMPLETE RESPONSE/NON-PROGRESSIVE DISEASE", "SD", Response)) %>%
+  dplyr::mutate(Response = ifelse(Response == "NOT DONE", "Other", Response)) %>%
+  dplyr::mutate(Response = ifelse(Response == "NOT EVALUABLE", "Other", Response)) %>%
+  dplyr::filter(Loc != "") %>%
+  dplyr::mutate(Loc = ifelse(Loc == "NEOPLASM, COLON", "Colon", "Rectal")) %>%
+  dplyr::mutate(Trt = ifelse(Trt == "Cetuximab", "Cetux", "Pani"))
+
+# somatic mutations sheet
+# don't need to look at the rearrangements sheet since they don't come with MAFs.
+somat763_noZero <- fread("alias_ndb_mutations.csv", select=c(2,4,5,7,8,12,14,16,29)) %>%
+  set_colnames(c("Visit", "VisitDate", "VisitTime", "AltID", "Gene", "AA",
+                 "Consequence", "MAF", "subID")) %>%
+  dplyr::mutate(binTime = ifelse(Visit == "FUP", "FUP", "Baseline")) 
+
+# sample codes for 0 mutations people, 57 of them
+zeroMuts763 <- fread("alias_ndb_sample_codes.csv", select=c(2,4,9)) %>%
+  set_colnames(c("Visit", "AltID", "subID")) %>%
+  dplyr::mutate(binTime = ifelse(Visit == "FUP", "FUP", "Baseline")) %>%
+  dplyr::filter(!(AltID %in% somat763_noZero$AltID) & subID %in% somat763_noZero$subID) %>%
+  dplyr::mutate(VisitDate = NA, VisitTime = NA, Gene = "NONE", AA = "NONE", Consequence = "None", MAF = 0)
+
+# bind zero and non-zero
+somat763 <- rbind(somat763_noZero, zeroMuts763) %>%
+  mutate(MAF = MAF * 100)
+
+# filter the covariate data to those in somat007
+cov763 <- cov763 %>% filter(subID %in% somat763$subID) %>%
+  mutate(Study = "s763")
+
+# save the data
+# setwd('/users/rsun3/desktop')
+# write.table(somat763, "mutations763.txt", append=F, quote=F, row.names=F, col.names=T, sep='\t')
+# write.table(cov763, "covariates763.txt", append=F, quote=F, row.names=F, col.names=T, sep='\t')
+
+# a check to make sure each subject has at most two timepoints 
+# time763 <- somat763 %>% 
+#  dplyr::select(subID, binTime) %>% distinct()
+# table(time763$subID)
+# length(which(table(time763$subID)== 2)) # 331 subjects with paired data
+
+#dim(somat763)  # 6612 mutations
+#dim(somat763 %>% filter(binTime == "Baseline")) # 2844 mutations in baseline
+#dim(somat763 %>% filter(binTime == "FUP")) # 3768 mutations in FUP
+#length(unique(somat763$subID)) # 335 subjects
+#length(which(unique(somat763$subID) %in% cov763$subID))
+```
+
+
+
+```{r, all covariates, eval=TRUE, results='hide', cache=FALSE, message=FALSE, warning=FALSE}
+
+# put all the covariates into a single table
+allCov <- rbind(cov203 %>% dplyr::mutate(subID = paste0("203_", subID)) %>% 
+                  dplyr::select(-Study, -LivOnly) %>%
+                  dplyr::mutate(EGFRi = ifelse(Trt == "PaniFFox", 1, 0)),
+                cov763 %>% dplyr::mutate(subID = paste0("763_", subID)) %>% 
+                  dplyr::select(-Study, -LiverMet) %>%
+                  dplyr::mutate(EGFRi = 1),
+                cov007 %>% dplyr::mutate(subID = paste0("007_", subID)) %>% 
+                  dplyr::select(-Study, -LiverMet) %>%
+                  dplyr::mutate(EGFRi = ifelse(Trt == "Pani", 1, 0)))
+
+# you may also need PGID (from 203) and altID (from 007) at some point
+otherIDs <- qcSheet %>% 
+  dplyr::select(PGID, subID) %>%
+  dplyr::mutate(subID = paste0("203_", subID)) %>%
+  dplyr::mutate(altID = NA) %>%
+  dplyr::distinct() %>%
+  rbind(., inventory %>% dplyr::select(altID, subID) %>% dplyr::mutate(subID = paste0("007_", subID)) %>% dplyr::mutate(PGID = NA) %>% distinct()) 
+mergedCov <- merge(otherIDs, allCov, by="subID", all.y = TRUE)
+
+#setwd('/users/rsun3/desktop')
+#write.table(allCov, "mergedCov.txt", append=F, quote=F, row.names=F, col.names=T, sep='\t')
+
+
+```
+
+```{r,  cleaning for paired samples, eval=TRUE, results='show', cache=FALSE, message=FALSE, warning=FALSE}
+
+# The abs203 files make one row for each visit from each patient, it uses pivot_wider on the
+# mutations.
+# absAll rbinds the three studies and keeps only mutations found in all three.
+# The pairedAll file keeps only those who had paired data.
+
+# vector of people who had both a "W1PRE_DOS_ST" and "FU" visit
+paired007 <- somat007 %>% 
+  dplyr::select(subID, Visit) %>%
+  dplyr::filter(Visit %in% c("W1PRE_DOS_ST", "FU")) %>%
+  dplyr::group_by(subID) %>%
+  dplyr::summarize(nVisit = length(unique(Visit))) %>%
+  dplyr::filter(nVisit == 2) %>%
+  dplyr::select(subID) %>%
+  unlist(.)
+
+# again, only people who had baseline and follow-up (only two possible times here)
+paired203 <- somat203 %>% 
+  dplyr::select(subID, Visit) %>%
+  dplyr::group_by(subID) %>%
+  dplyr::summarize(nVisit = length(unique(Visit))) %>%
+  dplyr::filter(nVisit == 2) %>%
+  dplyr::select(subID) %>%
+  unlist(.)
+
+# only two possible visits here
+paired763 <- somat763 %>% 
+  dplyr::select(subID, Visit) %>%
+  dplyr::group_by(subID) %>%
+  dplyr::summarize(nVisit = length(unique(Visit))) %>%
+  dplyr::filter(nVisit == 2) %>%
+  dplyr::select(subID) %>%
+  unlist(.)
+
+# all mutations together, one row per subject
+abs203 <- somat203 %>%
+  dplyr::mutate(paired = ifelse(subID %in% paired203, 1, 0)) %>% 
+  dplyr::select(Gene, MAF, subID, binTime, paired) %>%
+  # pivot wider
+  tidyr::pivot_wider(id_cols = c(subID, binTime, paired), names_from=Gene, values_from = MAF,
+              values_fn = list(MAF = max),
+              values_fill = list(MAF = 0)) %>%
+  dplyr::mutate(subID = paste0("203_", subID))
+abs007 <- somat007 %>%
+  dplyr::mutate(paired = ifelse(subID %in% paired007, 1, 0)) %>% 
+  dplyr::select(Gene, MAF, subID, binTime, paired) %>%
+  # pivot wider
+  tidyr::pivot_wider(id_cols = c(subID, binTime, paired), names_from=Gene, values_from = MAF,
+              values_fn = list(MAF = max),
+              values_fill = list(MAF = 0)) %>%
+  dplyr::mutate(subID = paste0("007_", subID))
+abs763 <- somat763 %>%
+  dplyr::mutate(paired = ifelse(subID %in% paired763, 1, 0)) %>% 
+  dplyr::select(Gene, MAF, subID, binTime, paired) %>%
+  # pivot wider
+  tidyr::pivot_wider(id_cols = c(subID, binTime, paired), names_from=Gene, values_from = MAF,
+              values_fn = list(MAF = max),
+              values_fill = list(MAF = 0)) %>%
+  dplyr::mutate(subID = paste0("763_", subID))
+
+# not all column names exist in each one
+keepCols <- intersect(intersect(colnames(abs203), colnames(abs007)), colnames(abs763))
+
+# merge all, keep only paired
+absAll <- rbind(abs007 %>% dplyr::select(all_of(keepCols)), 
+                  abs203  %>% dplyr::select(all_of(keepCols)), 
+                  abs763  %>% dplyr::select(all_of(keepCols))) %>% dplyr::select(-NONE)
+# paired only
+absPaired <- absAll %>% filter(paired == 1) 
+
+
+```
+
+
+
+```{r, cleaning for rMAFs, eval=TRUE, results='show', cache=FALSE, message=FALSE, warning=FALSE}
+
+
+# The rmaf007 files make one row for each visit from each patient, it uses pivot_wider on the
+# mutations. 
+# The rmafAll file keeps only those mutatations in all studies and rowbinds the 
+# three tables into one.
+# The rmafPaired file keeps only those who had paired data.
+
+# need to get maxMAFs for each sample, then get merge back and get rMAFs
+max007 <- somat007 %>% dplyr::select(subID, Visit, Gene, MAF) %>%
+  dplyr::group_by(subID, Visit) %>%
+  dplyr::summarise(MaxMAF = max(MAF))
+max203 <- somat203 %>% dplyr::select(subID, Visit, Gene, MAF) %>%
+  dplyr::group_by(subID, Visit) %>%
+  dplyr::summarise(MaxMAF = max(MAF))
+max763 <- somat763 %>% dplyr::select(subID, Visit, Gene, MAF) %>%
+  dplyr::group_by(subID, Visit) %>%
+  dplyr::summarise(MaxMAF = max(MAF))
+
+# now calculate rMAFs
+somat007rmaf <- merge(somat007, max007, by=c("subID", "Visit")) %>%
+  dplyr::mutate(rMAF = MAF / MaxMAF) %>% 
+  dplyr::mutate(paired = ifelse(subID %in% paired007, 1, 0))
+somat203rmaf <- merge(somat203, max203, by=c("subID", "Visit")) %>%
+  dplyr::mutate(rMAF = MAF / MaxMAF) %>%
+  dplyr::mutate(paired = ifelse(subID %in% paired203, 1, 0))
+somat763rmaf <- merge(somat763, max763, by=c("subID", "Visit")) %>%
+  dplyr::mutate(rMAF = MAF / MaxMAF) %>%
+  dplyr::mutate(paired = ifelse(subID %in% paired763, 1, 0))
+
+# one row per patient per visit thanks to pivot_wider, all rMAFs
+rmaf007 <- somat007rmaf %>% 
+  dplyr::select(Gene, rMAF, subID, binTime, paired) %>%
+  tidyr::pivot_wider(id_cols = c(subID, binTime, paired), names_from=Gene, values_from = rMAF,
+              values_fn = list(rMAF = max),
+              values_fill = list(rMAF = 0)) %>%
+  dplyr::mutate(subID = paste0("007_", subID))
+rmaf203 <- somat203rmaf %>% 
+  dplyr::select(Gene, rMAF, subID, binTime, paired) %>%
+  tidyr::pivot_wider(id_cols = c(subID, binTime, paired), names_from=Gene, values_from = rMAF,
+              values_fn = list(rMAF = max),
+              values_fill = list(rMAF = 0)) %>%
+  dplyr::mutate(subID = paste0("203_", subID))
+rmaf763 <- somat763rmaf %>% 
+  dplyr::select(Gene, rMAF, subID, binTime, paired) %>%
+  tidyr::pivot_wider(id_cols = c(subID, binTime, paired), names_from=Gene, values_from = rMAF,
+              values_fn = list(rMAF = max),
+              values_fill = list(rMAF = 0)) %>%
+  dplyr::mutate(subID = paste0("763_", subID))
+
+# not all column names exist in each one
+keepCols <- intersect(intersect(colnames(rmaf007), colnames(rmaf203)), colnames(rmaf763))
+# merge
+rmafAll <- rbind(rmaf007 %>% dplyr::select(all_of(keepCols)), 
+                  rmaf203  %>% dplyr::select(all_of(keepCols)), 
+                  rmaf763  %>% dplyr::select(all_of(keepCols))) %>% 
+  dplyr::select(-NONE)
+
+# paired only
+rmafPaired <- rmafAll %>% dplyr::filter(paired == 1) 
+
+
+# save
+#setwd('/users/rsun3/desktop/')
+#write.table(rmafPaired, "rmafPaired.txt", append=F, quote=F, row.names=F, col.names=T, sep='\t')
+#write.table(absPaired, "absPaired.txt", append=F, quote=F, row.names=F, col.names=T, sep='\t')
+
+# dim(rmafPaired) # 1138 subjects, 33 genes
+
+```
+
+
+
