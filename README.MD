@@ -9,7 +9,7 @@ with the clean_data.Rmd file. This file will produce separate text files with th
 then be used to reproduce the numbers and figures in the manuscript such as the one below.
 
 
-![Sankey plot for 203 study](Figures/sankey203.pdf)
+![Sankey plot for 203 study](Figures/sankey203.png)
 
 
 
